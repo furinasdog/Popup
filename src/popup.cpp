@@ -112,3 +112,123 @@ POPUP_API int popup_ask(const char* title, const char* message)
                           MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND);
     return (ret == IDYES) ? 1 : 0;
 }
+
+// ============================================================
+// DLL 依赖检测
+// ============================================================
+
+// 解析搜索目录：若 search_dir 为 NULL 则回退到当前工作目录
+static std::wstring resolve_search_dir(const char* search_dir)
+{
+    if (search_dir && search_dir[0]) {
+        return utf8_to_wstring(search_dir);
+    }
+    wchar_t cwd[MAX_PATH];
+    GetCurrentDirectoryW(MAX_PATH, cwd);
+    return std::wstring(cwd);
+}
+
+// 在 wdir 下用通配符 pattern 搜索匹配的 DLL 文件，
+// 对每个找到的文件尝试 LoadLibraryExW。
+// 加载成功则 FreeLibrary 并继续；加载失败则调用 on_fail 回调并返回 1。
+// 如果全部加载成功或没有匹配文件，返回 0。
+static int check_dll_glob(const std::wstring& wdir,
+                          const wchar_t*     pattern,
+                          void (*on_fail)())
+{
+    std::wstring search = wdir + L"\\" + pattern;
+    WIN32_FIND_DATAW fd;
+    HANDLE hFind = FindFirstFileW(search.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        return 0;   // 没有匹配文件
+    }
+
+    int result = 0;
+    do {
+        // 跳过目录项
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+
+        std::wstring dll_path = wdir + L"\\" + fd.cFileName;
+
+        // 抑制系统错误弹窗（与 ggml-backend-dl.cpp 行为一致）
+        DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
+        SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
+
+        HMODULE hMod = LoadLibraryExW(
+            dll_path.c_str(), NULL,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+
+        SetErrorMode(old_mode);
+
+        if (!hMod) {
+            // 文件存在但无法加载 —— 依赖缺失
+            on_fail();
+            result = 1;
+            break;
+        }
+        FreeLibrary(hMod);
+    } while (FindNextFileW(hFind, &fd));
+
+    FindClose(hFind);
+    return result;
+}
+
+// 同上，但匹配单个确定文件名而非通配符
+static int check_dll_file(const std::wstring& wdir,
+                          const wchar_t*     filename,
+                          void (*on_fail)())
+{
+    std::wstring dll_path = wdir + L"\\" + filename;
+
+    // 先检查文件是否存在
+    DWORD attrs = GetFileAttributesW(dll_path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return 0;
+    }
+
+    DWORD old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
+    SetErrorMode(old_mode | SEM_FAILCRITICALERRORS);
+
+    HMODULE hMod = LoadLibraryExW(
+        dll_path.c_str(), NULL,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+
+    SetErrorMode(old_mode);
+
+    if (!hMod) {
+        on_fail();
+        return 1;
+    }
+    FreeLibrary(hMod);
+    return 0;
+}
+
+static void on_cuda_fail()
+{
+    popup_error(
+        "CUDA Runtime 缺失",
+        "无法加载 CUDA 后端 (ggml-cuda.dll)，可能未安装 CUDA 12 运行时。\n\n"
+        "请下载并安装 CUDA 12 Runtime：\n"
+        "https://developer.nvidia.com/cuda-downloads");
+}
+
+static void on_runtime_fail()
+{
+    popup_error(
+        "VC++ 运行时缺失",
+        "无法加载必要的运行库，可能未安装 Microsoft Visual C++ 运行时。\n\n"
+        "请下载并安装 VC++ Redistributable：\n"
+        "https://aka.ms/vs/18/release/vc_redist.x64.exe");
+}
+
+POPUP_API int popup_check_cuda(const char* search_dir)
+{
+    std::wstring wdir = resolve_search_dir(search_dir);
+    return check_dll_glob(wdir, L"ggml-cuda*.dll", on_cuda_fail);
+}
+
+POPUP_API int popup_check_runtime(const char* search_dir)
+{
+    std::wstring wdir = resolve_search_dir(search_dir);
+    return check_dll_file(wdir, L"ggml-base.dll", on_runtime_fail);
+}
